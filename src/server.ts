@@ -16,8 +16,8 @@ import {
 
 import { Intelephense, IntelephenseConfig, InitialisationOptions, LanguageRange } from 'intelephense';
 
-// Create a connection for the server. The connection uses Node's IPC as a transport
-let connection: IConnection = createConnection(new IPCMessageReader(process), new IPCMessageWriter(process));
+// Create a connection for the server. Transport should default to cmd line flags
+let connection: IConnection = createConnection();
 let initialisedAt: [number, number];
 
 const languageId = 'php';

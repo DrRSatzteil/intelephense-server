@@ -3,7 +3,8 @@
 		"target": "es6",
 		"module": "commonjs",
 		"moduleResolution": "node",
-		"sourceMap": true,
+		"noImplicitAny": true,
+        "removeComments": true,
 		"lib" : [ "es2016" ],
 		"outDir": "lib"
 	},

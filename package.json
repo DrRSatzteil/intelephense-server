@@ -1,9 +1,10 @@
 {
   "name": "intelephense-server",
   "description": "Node.js PHP Language Server",
-  "version": "0.8.5-alpha.2",
+  "version": "0.8.6",
   "author": "Ben Mewburn <ben@mewburn.id.au>",
   "license": "ISC",
+  "main": "./lib/server.js",
   "engines": {
     "node": "*"
   },
@@ -18,7 +19,7 @@
   "scripts": {
     "build": "npm run clean && ./node_modules/.bin/tsc -p ./tsconfig.json",
     "clean": "rm -rf ./lib && mkdir ./lib",
-    "prepublish": "npm run build"
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "php",

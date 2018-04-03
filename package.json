@@ -3,7 +3,7 @@
   "description": "Node.js PHP Language Server",
   "version": "0.8.8",
   "author": "Ben Mewburn <ben@mewburn.id.au>",
-  "license": "ISC",
+  "license": "agpl-3.0",
   "main": "./lib/server.js",
   "engines": {
     "node": "*"

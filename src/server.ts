@@ -26,67 +26,60 @@ import {
 	CompletionItem, CompletionItemKind, RequestType, TextDocumentItem,
 	PublishDiagnosticsParams, SignatureHelp, DidChangeConfigurationParams,
 	Position, TextEdit, Disposable, DocumentRangeFormattingRequest,
-	DocumentFormattingRequest, DocumentSelector, TextDocumentIdentifier
+	DocumentFormattingRequest, DocumentSelector, TextDocumentIdentifier,
+	CancellationToken, CancellationTokenSource, FileChangeType, FileEvent, MessageActionItem
 } from 'vscode-languageserver';
-
 import { Intelephense, IntelephenseConfig, InitialisationOptions, LanguageRange } from 'intelephense';
+import { Workspace, FileInfo } from './workspace';
 
-// Create a connection for the server. Transport should default to cmd line flags
-let connection: IConnection = createConnection();
-let initialisedAt: [number, number];
-
-const languageId = 'php';
-const discoverSymbolsRequest = new RequestType<{ textDocument: TextDocumentItem }, number, void, void>('discoverSymbols');
-const discoverReferencesRequest = new RequestType<{ textDocument: TextDocumentItem }, number, void, void>('discoverReferences');
-const forgetRequest = new RequestType<{ uri: string }, void, void, void>('forget');
+const PHP_LANGUAGE_ID = 'php';
 const importSymbolRequest = new RequestType<{ uri: string, position: Position, alias?: string }, TextEdit[], void, void>('importSymbol');
 const documentLanguageRangesRequest = new RequestType<{ textDocument: TextDocumentIdentifier }, { version: number, ranges: LanguageRange[] }, void, void>('documentLanguageRanges');
-const knownDocumentsRequest = new RequestType<void, { timestamp: number, documents: string[] }, void, void>('knownDocuments');
 
-interface VscodeConfig extends IntelephenseConfig {
-	formatProvider: { enable: boolean }
-}
 
-let config: VscodeConfig = {
-	debug: {
-		enable: false
-	},
-	completionProvider: {
-		maxItems: 100,
-		addUseDeclaration: true,
-		backslashPrefix: false
-	},
-	diagnosticsProvider: {
-		debounce: 1000,
-		maxItems: 100
-	},
-	file: {
-		maxSize: 1000000
-	},
-	formatProvider: {
-		enable: true
-	}
+// Create a connection for the server. 
+// Transport should default to cmd line flags
+let connection: IConnection = createConnection();
+let initializeParams: InitializeParams;
+let docFormatRegister: Thenable<Disposable>;
+let config: ServerConfig;
+let folders: LocalFolder[];
+let logger = {
+	info: connection.console.info,
+	warn: connection.console.warn,
+	error: connection.console.error
 };
+let indexing: CancellationTokenSource;
 
-
+// Initialise 
 connection.onInitialize((params) => {
-	initialisedAt = process.hrtime();
-	connection.console.info('Initialising');
-	let initOptions = <InitialisationOptions>{
-		storagePath: params.initializationOptions.storagePath,
-		logWriter: {
-			info: connection.console.info,
-			warn: connection.console.warn,
-			error: connection.console.error
-		},
-		clearCache: params.initializationOptions.clearCache
+
+	initializeParams = params;
+	logger.info('Initialising');
+
+	let initialiseStart = process.hrtime();
+	let intelephenseInitOptions = <InitialisationOptions>{
+		cache: undefined,
+		logWriter: logger,
+		clearCache: params.initializationOptions ? params.initializationOptions.clearCache : false
 	}
 
-	return Intelephense.initialise(initOptions).then(() => {
-		Intelephense.onPublishDiagnostics((args) => {
-			connection.sendDiagnostics(args);
+	//fallback list for open folders
+	if (params.workspaceFolders) {
+		params.workspaceFolders.forEach(f => {
+			Workspace.addFolder(f);
 		});
-		connection.console.info(`Initialised in ${elapsed(initialisedAt).toFixed()} ms`);
+	} else if (params.rootUri) {
+		Workspace.addFolder({uri: params.rootUri, name: params.rootUri});
+	} else {
+		folders = [];
+	}
+
+	return Intelephense.initialise(
+		intelephenseInitOptions
+	).then(() => {
+
+		logger.info(`Initialised in ${elapsed(initialiseStart).toFixed()} ms`);
 
 		return <InitializeResult>{
 			capabilities: {
@@ -95,31 +88,77 @@ connection.onInitialize((params) => {
 				workspaceSymbolProvider: true,
 				completionProvider: {
 					triggerCharacters: [
-						'$', '>', ':', '\\', //php
-						'.', '<', '/' //html/js
+						//php
+						'$', '>', ':', '\\',
+						// html/js
+						// registered to enable request forwarding in vscode client
+						'.', '<', '/'
 					]
 				},
 				signatureHelpProvider: {
 					triggerCharacters: ['(', ',']
 				},
 				definitionProvider: true,
-				//documentFormattingProvider: true,
 				documentRangeFormattingProvider: false,
 				referencesProvider: true,
-				documentLinkProvider: { resolveProvider: false },
 				hoverProvider: true,
-				documentHighlightProvider: true
+				documentHighlightProvider: true,
+				// not implemented but registered to intercept calls in vscode client middleware
+				documentLinkProvider: { resolveProvider: false }
 			}
 		}
 	});
 
 });
 
-let docFormatRegister: Thenable<Disposable> = null;
+// initialised sent once after the client has recceived intialise response
+// and before any other requests
+// do setup and workspace indexing here
+connection.onInitialized(() => {
+
+	//register notify diagnostics 
+	Intelephense.onPublishDiagnostics((args) => {
+		connection.sendDiagnostics(args);
+	});
+
+	//fetch config
+	connection.workspace.getConfiguration(
+		'intelephense'
+	).then((settings: ServerConfig) => {
+
+		if (!settings) {
+			connection.console.warn('Failed to get configuration from client.');
+		} else {
+			config = settings;
+			//set intelephese config
+
+			let associations = getConfigValue<string[]>('files.associations', ['*.php']);
+			let exclude = getConfigValue<string[]>('files.exclude', []);
+			folders.forEach(f => {
+				f.associations = associations;
+				f.exclude = exclude;
+			});
+
+		}
+
+		//dynamically register format provider
+		if (getConfigValue('formatProvider.enable', true)) {
+			let documentSelector: DocumentSelector = [{ language: PHP_LANGUAGE_ID, scheme: 'file' }];
+			if (!docFormatRegister) {
+				docFormatRegister = connection.client.register(DocumentRangeFormattingRequest.type, { documentSelector });
+			}
+		}
+
+		//index workspace
+		Indexer.indexWorkspace();
+
+	});
+
+});
 
 connection.onDidChangeConfiguration((params) => {
 
-	let settings = params.settings.intelephense as VscodeConfig;
+	let settings = params.settings.intelephense as ServerConfig;
 	if (!settings) {
 		return;
 	}
@@ -128,7 +167,7 @@ connection.onDidChangeConfiguration((params) => {
 
 	let enableFormatter = config.formatProvider && config.formatProvider.enable;
 	if (enableFormatter) {
-		let documentSelector: DocumentSelector = [{ language: languageId, scheme: 'file' }];
+		let documentSelector: DocumentSelector = [{ language: PHP_LANGUAGE_ID, scheme: 'file' }];
 		if (!docFormatRegister) {
 			docFormatRegister = connection.client.register(DocumentRangeFormattingRequest.type, { documentSelector });
 		}
@@ -141,7 +180,7 @@ connection.onDidChangeConfiguration((params) => {
 
 });
 
-//atm for html compatibility
+//For now registered to intercept requests in vscode client
 connection.onDocumentLinks((params) => {
 	return [];
 });
@@ -156,11 +195,16 @@ connection.onDocumentHighlight((params) => {
 
 connection.onDidOpenTextDocument((params) => {
 
-	if (params.textDocument.text.length > config.file.maxSize) {
-		connection.console.warn(`${params.textDocument.uri} not opened -- over max file size.`);
+	// assume ascii when checking file size
+	if (params.textDocument.text.length > getConfigValue('files.maxSize', 1000000)) {
+		logger.warn(`${params.textDocument.uri} not opened -- over max file size.`);
 		return;
 	}
-		
+
+	if (params.textDocument.languageId !== PHP_LANGUAGE_ID) {
+		return;
+	}
+
 	Intelephense.openDocument(params.textDocument);
 });
 
@@ -202,35 +246,43 @@ connection.onDocumentRangeFormatting((params) => {
 
 connection.onShutdown(Intelephense.shutdown);
 
-connection.onRequest(discoverSymbolsRequest, (params) => {
+connection.onDidChangeWatchedFiles((params) => {
+	
+	// batch these because files that are to be indexed
+	// are first confirmed to be in a folder which
+	// involves reading composer.json
+	const toForget:string[] = [];
+	const toIndex:string[] = [];
+	let e:FileEvent
 
-	if (params.textDocument.text.length > config.file.maxSize) {
-		connection.console.warn(`${params.textDocument.uri} exceeds max file size.`);
-		return 0;
+	for(let n = 0, l = params.changes.length; n < l; ++n) {
+		e = params.changes[n];
+		if(e.type === FileChangeType.Deleted) {
+			toForget.push(e.uri);
+		} else {
+			toIndex.push(e.uri);
+		}
 	}
 
-	return Intelephense.discoverSymbols(params.textDocument);
+	Indexer.forgetFiles(toForget);
+	Indexer.indexFiles(toIndex);
+
 });
 
-connection.onRequest(discoverReferencesRequest, (params) => {
+connection.workspace.onDidChangeWorkspaceFolders((params) => {
+	params.added.forEach(f => {
+		Workspace.addFolder(f);
+	})
 
-	if (params.textDocument.text.length > config.file.maxSize) {
-		connection.console.warn(`${params.textDocument.uri} exceeds max file size.`);
-		return 0;
-	}
-	return Intelephense.discoverReferences(params.textDocument);
-});
+	params.removed.forEach(f => {
+		Workspace.removeFolder(f);
+	});	
 
-connection.onRequest(forgetRequest, (params) => {
-	return Intelephense.forget(params.uri);
+	Indexer.indexWorkspace(true);
 });
 
 connection.onRequest(importSymbolRequest, (params) => {
 	return Intelephense.provideContractFqnTextEdits(params.uri, params.position, params.alias);
-});
-
-connection.onRequest(knownDocumentsRequest, () => {
-	return Intelephense.knownDocuments();
 });
 
 connection.onRequest(documentLanguageRangesRequest, (params) => {
@@ -240,10 +292,190 @@ connection.onRequest(documentLanguageRangesRequest, (params) => {
 // Listen on the connection
 connection.listen();
 
+/**
+ * elapsed time in ms
+ * @param start 
+ */
 function elapsed(start: [number, number]) {
 	if (!start) {
-		return -1;
+		return 0;
 	}
 	let diff = process.hrtime(start);
 	return diff[0] * 1000 + diff[1] / 1000000;
+}
+
+function getConfigValue<T>(key: string, defaultValue: T): T {
+
+	const chain = key.split('.');
+	let prop: string;
+	let val: any = config;
+
+	while ((prop = chain.shift()) && val !== undefined) {
+		val = val[prop];
+	}
+
+	return val !== undefined ? val : defaultValue;
+}
+
+interface IndexResult {
+	totalFileCount: number;
+	indexedFileCount: number;
+	forgottenFileCount: number;
+	symbolCount:number;
+	elapsed: number;
+	wasCancelled?: boolean;
+}
+
+namespace Indexer {
+
+	var indexing: CancellationTokenSource;
+
+	export function isIndexing() {
+		return indexing !== undefined;
+	}
+
+	export async function indexWorkspace(restartIfInProgress?: boolean) {
+
+		const result: IndexResult = {
+			totalFileCount: 0,
+			indexedFileCount: 0,
+			forgottenFileCount: 0,
+			symbolCount: 0,
+			elapsed: 0
+		}
+
+		const start = process.hrtime();
+
+		if (indexing) {
+			if (!restartIfInProgress) {
+				result.wasCancelled = true;
+				return result;
+			} else {
+				cancelIndexing();
+			}
+		}
+
+		indexing = new CancellationTokenSource();
+		const token = indexing.token;
+		const knownDocs = Intelephense.knownDocuments();
+		const known: Set<string> = new Set(knownDocs.documents);
+		const timestamp = knownDocs.timestamp;
+		const maxFileSize = getConfigValue('files.maxSize', 1000000);
+		const associations = getConfigValue('files.associations', []);
+		associations.push('*.php');
+
+		const files = await Workspace.findFiles(
+			Array.from(new Set(associations)),
+			getConfigValue('files.exclude', []),
+			getConfigValue('indexer.useComposerJson', true)
+		);
+
+		let file:FileInfo;
+		let doc:TextDocumentItem;
+		for (let n = 0, l = files.length; n < l && !token.isCancellationRequested; ++n) {
+			
+			file = files[n];
+			if (known.has(file.uri)) {
+				known.delete(file.uri);
+				if (file.modified < timestamp) {
+					continue;
+				}
+			} else if (file.size > maxFileSize) {
+				logger.warn(`${file.uri} not opened -- over max file size.`);
+				continue;
+			}
+
+			doc = await Workspace.getDocument(file.uri);
+			if (doc) {
+				result.indexedFileCount++;
+				result.symbolCount += await discover(doc);
+			}
+		}
+
+		result.forgottenFileCount = known.size;
+		if (!token.isCancellationRequested && result.forgottenFileCount > 0) {
+			await forgetFiles(Array.from(known));
+		}
+
+		if(token.isCancellationRequested) {
+			result.wasCancelled = true;
+		}
+		result.elapsed = elapsed(start) / 1000;
+		return result;
+
+	}
+
+	export function cancelIndexing() {
+		if (!indexing) {
+			return;
+		}
+
+		indexing.cancel();
+		indexing.dispose();
+		indexing = undefined;
+	}
+
+	/**
+	 * files are first filtered to ensure they are part of workspace
+	 * @param uriArray 
+	 */
+	export async function indexFiles(uriArray: string[]) {
+		
+		const maxFileSize = getConfigValue('files.maxSize', 1000000);
+		const files = await Workspace.filterFiles(
+			uriArray,
+			getConfigValue('files.associations', ['*.php']),
+			getConfigValue('files.exclude', []),
+			getConfigValue('indexer.useComposerJson', true)
+		);
+
+		let file:FileInfo;
+		let doc: TextDocumentItem;
+		for(let n = 0, l = files.length; n < l; ++n) {
+			file = files[n];
+			if(file.size <= maxFileSize) {
+				doc = await Workspace.getDocument(file.uri);
+				await discover(doc);
+			}
+
+		}
+	}
+
+	export async function forgetFiles(uriArray: string[]) {
+		for (let n = 0; n < uriArray.length; ++n) {
+			await forget(uriArray[n]);
+		}
+	}
+
+	function forget(uri: string) {
+		return new Promise<void>((resolve, reject) => {
+			const fn = () => {
+				Intelephense.forget(uri);
+				resolve();
+			}
+			setImmediate(fn);
+		});
+	}
+
+	function discover(doc: TextDocumentItem) {
+		return new Promise<number>((resolve, reject) => {
+			const fn = () => {
+				const n = Intelephense.discoverSymbols(doc);
+				resolve(n);
+			}
+			setImmediate(fn);
+		});
+	}
+
+}
+
+interface ServerConfig {
+	formatProvider: {
+		enable: boolean
+	},
+	files: {
+		associations: string[],
+		exclude: string[],
+
+	}
 }

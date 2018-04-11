@@ -27,10 +27,13 @@ import {
 	PublishDiagnosticsParams, SignatureHelp, DidChangeConfigurationParams,
 	Position, TextEdit, Disposable, DocumentRangeFormattingRequest,
 	DocumentFormattingRequest, DocumentSelector, TextDocumentIdentifier,
-	CancellationToken, CancellationTokenSource, FileChangeType, FileEvent, MessageActionItem
+	CancellationToken, CancellationTokenSource, FileChangeType, FileEvent, MessageActionItem, WorkspaceFolder
 } from 'vscode-languageserver';
 import { Intelephense, IntelephenseConfig, InitialisationOptions, LanguageRange } from 'intelephense';
 import { Workspace, FileInfo } from './workspace';
+import {Cache} from './cache';
+import {Log} from './log';
+import * as os from 'os';
 
 const PHP_LANGUAGE_ID = 'php';
 const importSymbolRequest = new RequestType<{ uri: string, position: Position, alias?: string }, TextEdit[], void, void>('importSymbol');
@@ -43,26 +46,17 @@ let connection: IConnection = createConnection();
 let initializeParams: InitializeParams;
 let docFormatRegister: Thenable<Disposable>;
 let config: ServerConfig;
-let folders: LocalFolder[];
-let logger = {
-	info: connection.console.info,
-	warn: connection.console.warn,
-	error: connection.console.error
-};
-let indexing: CancellationTokenSource;
+let storagePath = os.tmpdir();
+
+Log.connection = connection;
 
 // Initialise 
 connection.onInitialize((params) => {
 
 	initializeParams = params;
-	logger.info('Initialising');
+	Log.info('Initialising');
 
 	let initialiseStart = process.hrtime();
-	let intelephenseInitOptions = <InitialisationOptions>{
-		cache: undefined,
-		logWriter: logger,
-		clearCache: params.initializationOptions ? params.initializationOptions.clearCache : false
-	}
 
 	//fallback list for open folders
 	if (params.workspaceFolders) {
@@ -71,15 +65,30 @@ connection.onInitialize((params) => {
 		});
 	} else if (params.rootUri) {
 		Workspace.addFolder({uri: params.rootUri, name: params.rootUri});
-	} else {
-		folders = [];
 	}
 
-	return Intelephense.initialise(
-		intelephenseInitOptions
-	).then(() => {
+	if(params.initializationOptions && params.initializationOptions.storagePath) {
+		storagePath = params.initializationOptions.storagePath
+	} 
 
-		logger.info(`Initialised in ${elapsed(initialiseStart).toFixed()} ms`);
+	let cachePromise:Promise<Cache>;
+	if(
+		(!params.initializationOptions || !params.initializationOptions.clearCache) &&
+		Workspace.hasFolders()
+	) {
+		cachePromise = Cache.create(cacheDir(Workspace.folderArray()));
+	} else {
+		cachePromise = Promise.resolve(undefined);
+	}
+
+	return cachePromise.then(c => {
+		return Intelephense.initialise({
+			logger:Log,
+			cache:c
+		});
+	}).then(() => {
+
+		Log.info(`Initialised in ${elapsed(initialiseStart).toFixed()} ms`);
 
 		return <InitializeResult>{
 			capabilities: {
@@ -127,17 +136,10 @@ connection.onInitialized(() => {
 	).then((settings: ServerConfig) => {
 
 		if (!settings) {
-			connection.console.warn('Failed to get configuration from client.');
+			Log.warn('Failed to get configuration from client.');
 		} else {
 			config = settings;
 			//set intelephese config
-
-			let associations = getConfigValue<string[]>('files.associations', ['*.php']);
-			let exclude = getConfigValue<string[]>('files.exclude', []);
-			folders.forEach(f => {
-				f.associations = associations;
-				f.exclude = exclude;
-			});
 
 		}
 
@@ -197,7 +199,7 @@ connection.onDidOpenTextDocument((params) => {
 
 	// assume ascii when checking file size
 	if (params.textDocument.text.length > getConfigValue('files.maxSize', 1000000)) {
-		logger.warn(`${params.textDocument.uri} not opened -- over max file size.`);
+		Log.warn(`${params.textDocument.uri} not opened -- over max file size.`);
 		return;
 	}
 
@@ -317,6 +319,24 @@ function getConfigValue<T>(key: string, defaultValue: T): T {
 	return val !== undefined ? val : defaultValue;
 }
 
+function cacheDir(folders:WorkspaceFolder[]) {
+	let concat = folders.reduce((last, current) => {
+		return last + current.uri;
+	}, '');
+	return Math.abs(hash32(concat)).toString(16);
+}
+
+function hash32(text: string) {
+    let hash = 0;
+    let chr: number;
+    for (let i = 0, l = text.length; i < l; ++i) {
+        chr = text.charCodeAt(i);
+        hash = ((hash << 5) - hash) + chr;
+        hash |= 0; // Convert to 32bit integer
+    }
+    return hash;
+}
+
 interface IndexResult {
 	totalFileCount: number;
 	indexedFileCount: number;
@@ -381,7 +401,7 @@ namespace Indexer {
 					continue;
 				}
 			} else if (file.size > maxFileSize) {
-				logger.warn(`${file.uri} not opened -- over max file size.`);
+				Log.warn(`${file.uri} not opened -- over max file size.`);
 				continue;
 			}
 

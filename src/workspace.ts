@@ -128,10 +128,14 @@ export namespace Workspace {
         });
     }
 
-    function folderArray() {
+    export function folderArray() {
         return Object.keys(folders).map(k => {
             return folders[k];
         });
+    }
+
+    export function hasFolders() {
+        return Object.keys(folders).length > 0;
     }
 
 }
